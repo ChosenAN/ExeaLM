@@ -6,33 +6,39 @@ be rescaled to the machine the hours are on.
     python experiments/throughput.py --sizes 0.5B --precision bf16 --compile 1 # what torch.compile buys
     python experiments/throughput.py --sizes 0.5B --precision bf16 --tf32 1    # what TF32 buys in the 32-bit parts
 
+    python experiments/throughput.py --models exealm,gated --precision bf16    # the two models the compute plan trains
+
 A row is one model at one size and precision: seconds per training step (forward, backward, gradient clip, optimizer)
 on random tokens, tokens per second, effective TFLOP/s (6 x parameters x tokens per second) and the peak GPU memory.
-"hybrid" is the size's preset without the memory circuits (as in the MI300X rows: 93.4M and 497.1M parameters with
-the 32k tokenizer) and "llama" the plain same-size Llama. If a batch does not fit the GPU, it is halved and the row
-says so.
+If a batch does not fit the GPU, it is halved and the row says so. The models:
 
-For bf16 rows the script also prints what each run of the compute plan would cost at the measured rate, next to what
-the plan assumed. These are single-GPU rates. For a 4-GPU run, time the real loop (experiments/expanse/README.md).
+    hybrid   the size's preset without the memory circuits (the MI300X rows: 93.4M and 497.1M parameters)
+    llama    the plain same-size Llama (the other MI300X rows)
+    exealm   the preset as the compute plan trains it: board and library slots, swarms of 4, no datastore
+    gated    the plan's baseline: a Llama with gated attention and QK-norm
+
+With bf16 rows the script also prints the compute plan (experiments/expanse/plan.py) at the measured rates. These are
+single-GPU rates. For a 4-GPU run, time the real loop (experiments/expanse/README.md).
 """
 import argparse
 import json
 import os
 import sys
 import time
+from dataclasses import replace
 
 import torch
 
-sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), ".."))
+HERE = os.path.dirname(os.path.abspath(__file__))
+sys.path[:0] = [os.path.join(HERE, ".."), os.path.join(HERE, "expanse")]
+import plan  # noqa: E402  (experiments/expanse/plan.py)
 from exealm import ExeaLM, Llama, MemoryContext, count_params, get_config, llama_baseline  # noqa: E402
 from exealm.config import MENU  # noqa: E402
 from exealm.train.pretrain import make_optimizer, pick_device  # noqa: E402
 
 PRESET = {"0.1B": "100m", "0.5B": "500m", "1B": "1b", "3B": "3b", "tiny": "tiny"}
 BATCH = {"0.1B": 32, "0.5B": 16, "1B": 16, "3B": 8, "tiny": 8}            # 0.1B and 0.5B: as measured on the MI300X
-# the compute plan (ExeaLM_nairr/6_compute_plan.tex): training tokens, and the GPU-hours it budgeted on MI300X rates
-PLAN = {("0.5B", "hybrid"): (30e9, 307), ("0.5B", "llama"): (30e9, 190), ("1B", "hybrid"): (20e9, 397),
-        ("1B", "llama"): (20e9, 248), ("3B", "hybrid"): (8e9, 477)}
+KINDS = ("hybrid", "llama", "exealm", "gated")
 
 
 def sync(dev):
@@ -43,12 +49,21 @@ def sync(dev):
 
 
 def build(size, kind, vocab, dev):
+    """The model, and what its forward pass is given: rows alone, or (for "exealm") swarms that share a board."""
+    if kind not in KINDS:
+        raise SystemExit(f"--models takes any of {', '.join(KINDS)}, not {kind}")
     over = dict(vocab_size=vocab) if size != "tiny" else {}
+    if kind == "exealm":
+        cfg = get_config(PRESET[size], **over)
+        return ExeaLM(cfg).to(dev), MemoryContext(swarm_size=cfg.swarm_size)
     cfg = get_config(PRESET[size], pinned={}, menu=tuple(t for t in MENU if t not in ("RG", "AG")), **over)
-    return (ExeaLM(cfg) if kind == "hybrid" else Llama(llama_baseline(cfg))).to(dev)
+    if kind == "gated":
+        cfg = replace(cfg, attn_gate=True, qk_norm=True)
+    model = ExeaLM(cfg) if kind == "hybrid" else Llama(cfg if kind == "gated" else llama_baseline(cfg))
+    return model.to(dev), MemoryContext()
 
 
-def measure(model, batch, a, dev, bf16):
+def measure(model, mem, batch, a, dev, bf16):
     """Median seconds per step over a.steps steps, after a.warmup steps that are not timed."""
     opt = make_optimizer(model, 1e-4, 0.1, fused=dev.type == "cuda")
     fwd = torch.compile(model) if a.compile else model
@@ -58,7 +73,7 @@ def measure(model, batch, a, dev, bf16):
         sync(dev)
         t0 = time.perf_counter()
         with torch.autocast(device_type=dev.type, dtype=torch.bfloat16) if bf16 else torch.enable_grad():
-            loss = fwd(x[:, :-1], MemoryContext(), x[:, 1:])[1]
+            loss = fwd(x[:, :-1], mem, x[:, 1:])[1]
         opt.zero_grad(set_to_none=True)
         loss.backward()
         torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
@@ -79,8 +94,8 @@ def row(size, kind, precision, a, dev):
                 torch.cuda.empty_cache()
                 torch.cuda.reset_peak_memory_stats(dev)
             torch.manual_seed(0)
-            model = build(size, kind, a.vocab, dev)
-            s = measure(model, batch, a, dev, precision == "bf16")
+            model, mem = build(size, kind, a.vocab, dev)
+            s = measure(model, mem, batch, a, dev, precision == "bf16")
             params = count_params(model)
             rec.update(params_M=round(params / 1e6, 1), batch=batch, s_per_step=round(s, 4),
                        tokens_per_s=round(batch * a.seq / s),
@@ -99,7 +114,7 @@ def row(size, kind, precision, a, dev):
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--sizes", default="0.1B,0.5B", help="any of " + ", ".join(PRESET))
-    ap.add_argument("--models", default="hybrid,llama")
+    ap.add_argument("--models", default="hybrid,llama", help="any of " + ", ".join(KINDS))
     ap.add_argument("--precision", default="bf16,fp32")
     ap.add_argument("--batch", type=int, default=0, help="rows per step (default: 32, 16, 16 and 8 for the four sizes)")
     ap.add_argument("--seq", type=int, default=512)
@@ -123,13 +138,10 @@ def main():
                 rows.append(dict(row(size, kind, precision, a, dev), gpu=gpu, torch=torch.__version__,
                                  compile=a.compile, tf32=a.tf32))
                 print(json.dumps(rows[-1]), flush=True)
-    plan = [(r, PLAN[(r["size"], r["model"])]) for r in rows
-            if r["precision"] == "bf16" and "tokens_per_s" in r and (r["size"], r["model"]) in PLAN]
-    if plan:
-        print("\nThe compute plan at these single-GPU rates:")
-        for r, (tokens, budget) in plan:
-            print(f"  {r['size']} {r['model']}: {tokens / 1e9:.0f}B tokens = {tokens / r['tokens_per_s'] / 3600:,.0f} "
-                  f"GPU-hours (the plan budgeted {budget})")
+    if any(r["precision"] == "bf16" and r["size"] in plan.SIZE_NAME and r.get("effective_TFLOPs", 0) > 0
+           for r in rows) and not (a.compile or a.tf32):
+        print("\nThe compute plan at these single-GPU rates:\n")
+        plan.table(*plan.measured(rows), plan.defaults())
     if a.out:
         os.makedirs(a.out, exist_ok=True)
         tag = a.tag or "".join(c if c.isalnum() else "_" for c in gpu.lower()).strip("_")

@@ -23,8 +23,12 @@
 #   DATA        the packed data to copy in: a folder or s3://bucket/prefix                       (default: ./data)
 #   SAVE_MIN    minutes between checkpoints (default 30)       MARGIN_MIN  minutes kept for the last save and copy (45)
 #   JOBS_LEFT   how many more jobs may follow this one (default 20)
-# A different partition, GPU count or time limit: SBATCH_PARTITION, SBATCH_GPUS and SBATCH_TIMELIMIT, e.g. one GPU on
-# the shared partition:  export SBATCH_PARTITION=nairr-gpu-shared SBATCH_GPUS=h100:1
+# A different partition, GPU count or time limit: SBATCH_PARTITION, SBATCH_GPUS and SBATCH_TIMELIMIT. Options sbatch
+# has no variable for go on its command line and, so that the follow-on jobs get them too, in SBATCH_EXTRA. One GPU
+# on the shared partition:
+#     export SBATCH_PARTITION=nairr-gpu-shared SBATCH_GPUS=h100:1 SBATCH_EXTRA="--ntasks-per-node=1"
+#     sbatch $SBATCH_EXTRA experiments/expanse/train.sb
+# The runs of the compute plan: `python experiments/expanse/plan.py --run <name> --lr <rate>` prints these lines.
 #
 # Only the partition, the GPU type and the time limit below come from SDSC's user guide. Compare the other lines with
 # SDSC's own sample (/cm/shared/examples/sdsc/ExpanseAIR/pytorch) and change what differs. Not yet run on Expanse.
@@ -110,5 +114,5 @@ elif [ "$JOBS_LEFT" -le 0 ]; then
   echo "== $(date '+%F %T') stopped at the time limit and JOBS_LEFT is used up. Submit again to continue"
 else
   export JOBS_LEFT=$((JOBS_LEFT - 1))
-  echo "== $(date '+%F %T') stopped at the time limit. Next job: $(sbatch --parsable experiments/expanse/train.sb)"
+  echo "== $(date '+%F %T') stopped at the time limit. Next job: $(sbatch --parsable ${SBATCH_EXTRA:-} experiments/expanse/train.sb)"
 fi
