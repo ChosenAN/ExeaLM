@@ -26,8 +26,8 @@ doubts that a 0.1B model gains from long traces, so two options choose what to k
     --max_think_chars N        drop rows whose thinking is longer than N characters (both modes). Traces run about
                                3 characters per token with the 32k tokenizer (2.8 for math, 3.2 for code and science),
                                and sft.py cuts a conversation at --max_len (1024) tokens, so a kept trace much past
-                               3,000 characters is trained on only in part. The median trace is 16k characters in
-                               openmath, 23k in opencode and 50k in OpenThoughts3
+                               3,000 characters is trained on only in part. The median trace is 6,000 to 15,000
+                               tokens (results/post_data/lengths.json)
     python -m exealm.data.post openmath --think strip --max_rows 20000 --out data/post
     python -m exealm.data.post openthoughts3-science --max_think_chars 4000 --max_rows 20000 --out data/post
 
